@@ -214,7 +214,7 @@ def parse_args():
     parser.add_argument('--expert_repeat', type=int, default=1)
     parser.add_argument('--add_expert_size', type=int, default=0)
     parser.add_argument('--key_gate', action='store_true')
-    parser.add_argument('--gate_type', type=str, default='top', choices=['top', 'cosine_top', 'gated_multi_gate', 'gated_multi_gate_t'])
+    parser.add_argument('--gate_type', type=str, default='top', choices=['top', 'cosine_top', 'gated_multi_gate', 'gated_multi_gate_t', 'decoupled_top'])
     parser.add_argument('--one_score', action='store_true')
     parser.add_argument('--random_init_gate', action='store_true')
     parser.add_argument('--normalize_one_score_gate', action='store_true')
@@ -227,6 +227,7 @@ def parse_args():
     
     
     parser.add_argument('--aux_loss_weight', type=float, default=0.01)
+    parser.add_argument('--dynamic_aux_loss', action='store_true', help='Use dynamic auxiliary loss weight.')
     parser.add_argument('--gate_noise', type=float, default=1.0)
     parser.add_argument('--capacity_factor', type=float, default=1.5)
     parser.add_argument('--save_model', action='store_true')
@@ -710,24 +711,19 @@ def main(args, seed=0, lr=3e-5):
 
             # print(model)
             
-            if args.to_MoE and  args.aux_loss_weight > 0:
+            current_aux_loss_weight = args.aux_loss_weight
+            if args.dynamic_aux_loss:
+                current_aux_loss_weight *= (completed_steps / args.max_train_steps)
+
+            if args.to_MoE and current_aux_loss_weight > 0:
                 if 'bert' in args.model_name_or_path:
-                    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                        for i, layer in enumerate(model.module.bert.encoder.layer):
-                            if i in args.moe_layers and getattr(layer.mlp, 'l_aux', None) is not None:
-                     
-                                loss += layer.mlp.l_aux * args.aux_loss_weight
-                    else:
-                        for i, layer in enumerate(model.bert.encoder.layer):
-                            if i in args.moe_layers and getattr(layer.mlp, 'l_aux', None) is not None:
-                     
-                                loss += layer.mlp.l_aux * args.aux_loss_weight
-                            
+                    for i, layer in enumerate(model.bert.encoder.layer):
+                        if i in args.moe_layers and getattr(layer.mlp, 'l_aux', None) is not None:
+                            loss += layer.mlp.l_aux * current_aux_loss_weight
                 elif 'gpt' in args.model_name_or_path:
                     for i, layer in enumerate(model.transformer.h):
                         if i in args.moe_layers and getattr(layer.mlp, 'l_aux', None) is not None:
-    
-                            loss += layer.mlp.l_aux * args.aux_loss_weight
+                            loss += layer.mlp.l_aux * current_aux_loss_weight
             
             # We keep track of the loss at each epoch
             if args.with_tracking:
