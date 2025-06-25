@@ -2,18 +2,7 @@
 # Licensed under the MIT license.
 
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union, cast
-
-import copy
-import os
-import re
-import time
-import logging 
-import collections
-import importlib
-
-import torch
 from torch import Tensor
-import torch.distributed as dist
 from torch.nn import ModuleList
 import torch.nn.functional as F
 import numpy as np
@@ -105,6 +94,16 @@ class MOELayer(torch.nn.Module):
         normalize_one_score_gate=False,
         value_norm_weighted=False,
         update_momentum=0.0,
+        # DDG-ALS 创新参数
+        enable_ddg_als=False,  # 启用动态解耦门控和自适应损失调度
+        decoupled_gating=False,  # 解耦门控开关
+        adaptive_loss_schedule=False,  # 自适应损失调度开关
+        expert_momentum=0.9,  # 专家激活动量
+        temperature_init=1.0,  # 初始温度
+        temperature_decay=0.995,  # 温度衰减率
+        exploration_bonus_init=0.1,  # 初始探索奖励
+        exploration_decay=0.99,  # 探索奖励衰减
+        loss_schedule_warmup=1000,  # 损失调度预热步数
         # share_value=False,
         **kwargs
     ):
@@ -249,9 +248,43 @@ class MOELayer(torch.nn.Module):
             self.gates[0].wg.weight.require_grad = False
             self.value_norm_weighted = value_norm_weighted
             if self.value_norm_weighted:
-                print("### using value norm weighted key-gate ###")
+                self.register_buffer('expert_importance', torch.ones(self.num_global_experts) / self.num_global_experts)
         
-        self.record_routing = False    
+        # DDG-ALS 创新机制初始化
+        self.enable_ddg_als = enable_ddg_als
+        self.decoupled_gating = decoupled_gating
+        self.adaptive_loss_schedule = adaptive_loss_schedule
+        
+        if self.enable_ddg_als:
+            print(f"🚀 Initializing DDG-ALS: Decoupled Gating={decoupled_gating}, Adaptive Loss={adaptive_loss_schedule}")
+            
+            # 动态解耦门控相关参数
+            if self.decoupled_gating:
+                # 专家选择权重 (用于路由)
+                self.selection_gate = torch.nn.Linear(model_dim, self.max_num_global_experts, bias=False)
+                # 输出融合权重 (用于加权输出，基于动量更新)
+                self.register_buffer('fusion_weights', torch.ones(self.max_num_global_experts) / self.max_num_global_experts)
+                self.expert_momentum = expert_momentum
+                print(f"  ✓ Decoupled gating initialized with momentum {expert_momentum}")
+            
+            # 自适应温度机制
+            self.register_buffer('current_temperature', torch.tensor(temperature_init))
+            self.temperature_decay = temperature_decay
+            
+            # 专家激活历史跟踪
+            self.register_buffer('expert_activation_history', torch.zeros(self.max_num_global_experts))
+            self.register_buffer('expert_usage_count', torch.zeros(self.max_num_global_experts))
+            
+            # 自适应损失调度参数
+            if self.adaptive_loss_schedule:
+                self.register_buffer('training_step', torch.tensor(0))
+                self.exploration_bonus_init = exploration_bonus_init
+                self.exploration_decay = exploration_decay
+                self.loss_schedule_warmup = loss_schedule_warmup
+                self.register_buffer('current_aux_weight', torch.tensor(0.001))  # 初始很小的辅助损失
+                print(f"  ✓ Adaptive loss scheduling initialized with warmup {loss_schedule_warmup} steps")
+        
+        self.record_routing = False
         
         if seeds is not None and len(seeds) > 2 and seeds[2] is not None:
             torch.manual_seed(seeds[2])
@@ -294,203 +327,145 @@ class MOELayer(torch.nn.Module):
     def get_sample_records(self):
         return self.sample_records
     
-    def remove_experts(self, gate_index):
-        assert self.record_routing, "must record routing before removing experts"
-        assert hasattr(self.gates[gate_index], "experts_mask"), "gate network must have experts mask to allow adaptive process"
-
-        self.routing_records = C.simple_all_reduce(self.routing_records, self.group)
-
-        # print(self.routing_records)
-
-        signed_rounting_records = torch.sign(self.routing_records)
-        # print(self.gates[gate_index].experts_mask * signed_rounting_records[:self.max_num_global_experts])
-        self.gates[gate_index].experts_mask.data = (self.gates[gate_index].experts_mask * signed_rounting_records[:self.max_num_global_experts])
-
-    def add_experts(self, gate_index):
-        assert self.record_routing, "must record routing before adding experts"
-        assert hasattr(self.gates[gate_index], "experts_mask"), "gate network must have experts mask to allow adaptive process"
-
-        if self.sample_records is None:
-            return
-        
-        self.sample_records = C.simple_all_reduce(self.sample_records, self.group)
-        
-        # print(self.sample_records.shape)
-        normalized_sample_records = self.sample_records / torch.norm(self.sample_records)
-        # choose one expert that is not active
-        non_active_experts = np.argwhere(self.gates[gate_index].experts_mask.cpu().numpy() == 0)
-        if len(non_active_experts) > 0:
-            new_expert_index = non_active_experts[0][0]
-            self.gates[gate_index].experts_mask.data[new_expert_index] = 1.0
-            self.gates[gate_index].sim_matrix.data[:, new_expert_index] = normalized_sample_records.data
-            self.gates[gate_index].gates.data[new_expert_index] = torch.tensor(0.0)
-
-    def adaptive_update_experts(self, gate_index=0):
-        # print(self.gates[gate_index].gates)
-        before_num = int(self._num_global_experts.data)
-        self.remove_experts(gate_index)
-        self.add_experts(gate_index)
-        self._num_global_experts.data = torch.tensor(int(sum(self.gates[gate_index].experts_mask)))
-        end_num = int(self._num_global_experts.data)
-        print('Adaptive update: From {} experts -> {} experts'.format(before_num, end_num))
-
-        # print(self.num_global_experts, int(sum(self.gates[gate_index].experts_mask)))
-        # print(self.gates[gate_index].experts_mask)
-        # print(self.gates[gate_index].gates)
-
-
-
-
-    def forward(self, input: Tensor, gate_index=0, capacity_factor=None, top_k=None, a2a_ffn_overlap_degree=None, reserve_dims=1, inequivalent_tokens=False, adaptive_r=None):
-
-        # if  hasattr(self.gates[gate_index], 'adaptive_experts') and self.gates[gate_index].adaptive_experts:
-        #     self.begin_record_routing()
-
-
-        if self.skip_moe:
-            result_output = input
-            result_output.l_aux = None
-            return self.result_func(result_output) if self.result_func is not None else result_output
-
-        original_shape, original_dtype  = input.shape, input.dtype
-        assert len(original_shape) >= 2, "Input data must be at least 2D tensor: (s)amples, .., (m)odel_dim"
-
-        x = input.reshape(-1, original_shape[-reserve_dims:].numel())
-        for p in self.experts.parameters():
-            x = x.to(p.dtype)
-            break
-        gctx = self.gates[gate_index]
-        if a2a_ffn_overlap_degree is not None:
-            self.a2a_ffn_overlap_degree = a2a_ffn_overlap_degree
-        a2a_ffn_overlap_degree = self.a2a_ffn_overlap_degree
-
-        def routing(top_k):
-            logits, gate_top_k = gctx(x)
-
-            if self.training and gctx.gate_noise > 0:
-                logits_w_noise = logits + gctx.gate_noise * torch.randn_like(logits) / self.num_global_experts
-            else:
-                logits_w_noise = logits
-
-            if hasattr(gctx, "adaptive_top_k") and gctx.adaptive_top_k:
-                top_k = gate_top_k
-                scores = logits_w_noise
-            else:
-                scores = F.softmax(logits_w_noise, dim=1)
-
-
-            if self.is_gshard_loss:
-                _loss_fn = lambda gates, topk_ids: losses.gshard_loss(gates, topk_ids, self.num_global_experts)
-            elif gctx.enable_softmax_logits:
-                _loss_fn = lambda gates, topk_ids: losses.load_importance_loss(
-                    F.softmax(logits, dim=1), logits_w_noise.gather(index=topk_ids, dim=1),
-                    self.num_global_experts, gctx.gate_noise)
-            else:
-                _loss_fn = lambda gates, topk_ids: losses.diverse_and_simple_gate_loss(gates, topk_ids, gctx.sim_matrix, gctx.experts_mask)
-            return logits.dtype, extract_critical(scores,
-                top_k = gctx.top_k if top_k is None else top_k,
-                loss_fn = _loss_fn,
-                capacity_factor = gctx.capacity_factor if capacity_factor is None else capacity_factor,
-                batch_prioritized_routing = self.batch_prioritized_routing,
-                normalize_gate = self.normalize_gate,
-                group = self.group,
-                alignment = self.sharded_count * a2a_ffn_overlap_degree,
-                inequivalent_tokens = inequivalent_tokens,
-                one_score_gate = self.one_score_gate
-            )
-
-
-        if x.is_cuda:
-            with torch.cuda.amp.autocast(enabled=False):
-                logits_dtype, (crit, l_aux) = routing(top_k)
-        else:
-            logits_dtype, (crit, l_aux) = routing(top_k)
-
-        y = fast_encode(x.to(logits_dtype), crit, self.is_postscore).to(x.dtype)
-
-        if adaptive_r is not None:
-            self.adaptive_degree = adaptive_r
-
-        if self.adaptive_degree == 0:
-            y = self.expert_local(y, original_shape[-reserve_dims:])
-        else:
-            if self.auto_parallel:
-                self.use_model_parallel = (y.numel() * (self.sharded_count - 1) * 2 < sum([x.numel() for x in self.experts.parameters()]))
-
-            if self.num_global_experts < self.world_size: # need to promise this thing won't happen now
-                if self.use_model_parallel:
-                    y = y.repeat(1, self.adaptive_degree, 1).view(self.world_size, -1, y.size(2))
-                else:
-                    y = y.view(self.world_size, -1, y.size(2))
-
-            # Currently, GAMoE does not support this
-            if a2a_ffn_overlap_degree > 1 and y.is_cuda:
-                def expert_fn(expert_input):
-                    return self.expert_local(expert_input, original_shape[-reserve_dims:])
-                y = a2a_ffn_overlap_forward(y, expert_fn=expert_fn, a2a_ffn_overlap_degree=a2a_ffn_overlap_degree, use_2dh=self.use_2dh, group=self.group)
-            else:
-                # Currently, GAMoE only support this
-                y = C.all_to_all(y, 1, 0, use_2dh=self.use_2dh, group=self.group)
-                y = self.expert_local(y, original_shape[-reserve_dims:])
-                y = C.all_to_all(y, 0, 1, use_2dh=self.use_2dh, group=self.group)
-
-            if self.num_global_experts < self.world_size:
-                if self.use_model_parallel:
-                    y = torch.sum(y.view(self.num_global_experts, self.adaptive_degree, -1, y.size(2)), dim=1)
-                else:
-                    y = y.view(self.num_global_experts, -1, y.size(2))
-
-        y = fast_decode(y.to(logits_dtype), crit, self.is_postscore)
-        
-        if self.record_routing:
-            top_k_gates = torch.stack(crit[1]).to(torch.long).reshape(-1)
-            ones = torch.ones_like(top_k_gates)
-            self.routing_records.scatter_add_(0, top_k_gates, ones)
-
-            # get the samples that do not activate any experts
-            sample_experts_records = crit[1][0].to(torch.long)
-            # print(sample_experts_records)
-            # sample_experts_records = torch.sum(sample_experts_records < self.max_num_global_experts, dim=1)
-            # print(sample_experts_records)
-            sample_embeddings = x[sample_experts_records == self.max_num_global_experts]
-            # print(sample_embeddings.shape[0])
-            if sample_embeddings.shape[0] > 0:
-                if self.sample_records is None:
-                    self.sample_records = torch.zeros(self.model_dim, dtype=self.experts.batched_fc1_w.dtype, device=self.experts.batched_fc1_w.device)
-                self.sample_records += torch.sum(sample_embeddings, dim=0)
-
+    def dynamic_decoupled_gating(self, x, gate_logits):
+        """
+        动态解耦门控机制：将专家选择与输出融合权重解耦
+        """
+        if not self.decoupled_gating:
+            return gate_logits, None
             
-
-        y = y.view(list(original_shape[:-reserve_dims]) + list(self.protected_shape[-reserve_dims:])).to(original_dtype)
-        self.l_aux = y.l_aux = l_aux
-
-        # if  hasattr(self.gates[gate_index], 'adaptive_experts') and self.gates[gate_index].adaptive_experts:
-        #     self.adaptive_update_experts(gate_index)
-        #     self.end_record_routing()
-
-        return self.result_func(y) if self.result_func is not None else y
-
-    def update_one_score_gate(self):
-        assert self.one_score_gate, "one_score_gate must be True"
-
-        if self.value_norm_weighted:
-            value_norm = torch.norm(self.experts.batched_fc2_w, p=2, dim=-1, keepdim=True)
-            value_weight = F.normalize(value_norm, dim=-2, p=1)
-            weighted_keys = (self.experts.batched_fc1_w * value_weight).sum(dim=1)
+        batch_size, seq_len, model_dim = x.shape
+        x_flat = x.view(-1, model_dim)
+        
+        # 1. 专家选择权重 (用于路由决策)
+        selection_logits = self.selection_gate(x_flat)
+        selection_logits = selection_logits / self.current_temperature  # 温度缩放
+        
+        # 2. 基于历史激活模式的动态调整
+        expert_diversity_bonus = self._compute_diversity_bonus()
+        selection_logits = selection_logits + expert_diversity_bonus.unsqueeze(0)
+        
+        # 3. 输出融合权重基于动量更新
+        current_selection = F.softmax(selection_logits, dim=-1)
+        expert_activation = current_selection.mean(dim=0)  # 当前批次的专家激活率
+        
+        # 动量更新融合权重
+        self.fusion_weights.data = (self.expert_momentum * self.fusion_weights + 
+                                   (1 - self.expert_momentum) * expert_activation)
+        
+        # 4. 更新专家激活历史
+        self.expert_activation_history.data = (0.95 * self.expert_activation_history + 
+                                              0.05 * expert_activation)
+        self.expert_usage_count.data += (expert_activation > 0.01).float()
+        
+        return selection_logits, self.fusion_weights
+    
+    def _compute_diversity_bonus(self):
+        """
+        计算专家多样性奖励，鼓励使用不活跃的专家
+        """
+        # 基于使用频率的逆向奖励
+        usage_normalized = self.expert_usage_count / (self.expert_usage_count.sum() + 1e-8)
+        diversity_bonus = -torch.log(usage_normalized + 1e-8) * 0.01
+        
+        # 为从未使用的专家提供额外奖励
+        never_used_mask = (self.expert_usage_count == 0)
+        diversity_bonus[never_used_mask] += 0.1
+        
+        return diversity_bonus
+    
+    def adaptive_loss_scheduling(self, base_aux_loss):
+        """
+        自适应损失调度：训练早期鼓励探索，后期保证稳定
+        """
+        if not self.adaptive_loss_schedule:
+            return base_aux_loss
+            
+        step = self.training_step.item()
+        
+        # 1. 计算当前训练阶段的损失权重
+        if step < self.loss_schedule_warmup:
+            # 早期：低辅助损失 + 探索奖励
+            progress = step / self.loss_schedule_warmup
+            aux_weight = 0.001 + 0.009 * progress  # 从0.001逐渐增加到0.01
+            
+            # 探索奖励：鼓励专家分化
+            exploration_bonus = self.exploration_bonus_init * (self.exploration_decay ** step)
+            diversity_loss = self._compute_diversity_loss() * exploration_bonus
+            
+            total_loss = base_aux_loss * aux_weight + diversity_loss
+            
         else:
-            weighted_keys = self.experts.batched_fc1_w.data.mean(dim=1)
-
-        if self.normalize_one_score_gate:
-            if self.update_momentum:
-                self.gates[0].wg.weight.data.copy_(self.update_momentum * self.gates[0].wg.weight.data + (1 - self.update_momentum) * F.normalize(weighted_keys, dim=-1))
-            else:
-                self.gates[0].wg.weight.data.copy_(F.normalize(weighted_keys, dim=-1))
-        else:
-            if self.update_momentum:
-                self.gates[0].wg.weight.data.copy_(self.update_momentum * self.gates[0].wg.weight.data + (1 - self.update_momentum) * weighted_keys)
-            else:
-                if self.value_norm_weighted:
-                    value_norm
-                self.gates[0].wg.weight.data.copy_(weighted_keys)
-
-moe_layer = MOELayer
+            # 后期：标准辅助损失权重，注重稳定性
+            aux_weight = 0.01 + 0.01 * min(1.0, (step - self.loss_schedule_warmup) / 10000)  # 最高到0.02
+            stability_loss = self._compute_stability_loss() * 0.005
+            
+            total_loss = base_aux_loss * aux_weight + stability_loss
+        
+        # 更新当前辅助损失权重（用于记录）
+        self.current_aux_weight.data = torch.tensor(aux_weight)
+        
+        return total_loss
+    
+    def _compute_diversity_loss(self):
+        """
+        计算多样性损失，鼓励专家分化
+        """
+        # 专家激活的方差越大越好（鼓励分化）
+        activation_var = torch.var(self.expert_activation_history)
+        diversity_loss = -torch.log(activation_var + 1e-8)  # 负对数，方差越大损失越小
+        
+        # 专家使用平衡性
+        uniform_target = torch.ones_like(self.expert_activation_history) / len(self.expert_activation_history)
+        balance_loss = F.kl_div(F.log_softmax(self.expert_activation_history, dim=0), 
+                               uniform_target, reduction='batchmean')
+        
+        return diversity_loss + balance_loss
+    
+    def _compute_stability_loss(self):
+        """
+        计算稳定性损失，确保训练后期的稳定性
+        """
+        # 专家激活率的稳定性
+        target_activation = 1.0 / self.num_global_experts
+        stability_loss = F.mse_loss(self.expert_activation_history, 
+                                   torch.full_like(self.expert_activation_history, target_activation))
+        
+        # 防止专家激活率过于集中
+        max_activation = torch.max(self.expert_activation_history)
+        concentration_penalty = F.relu(max_activation - 2 * target_activation) ** 2
+        
+        return stability_loss + concentration_penalty
+    
+    def update_temperature(self):
+        """
+        更新门控温度，实现自适应温度调节
+        """
+        if self.enable_ddg_als:
+            self.current_temperature.data *= self.temperature_decay
+            self.current_temperature.data = torch.clamp(self.current_temperature.data, min=0.1, max=5.0)
+    
+    def get_ddg_als_stats(self):
+        """
+        获取DDG-ALS统计信息，用于监控和调试
+        """
+        if not self.enable_ddg_als:
+            return {}
+            
+        stats = {
+            'training_step': self.training_step.item(),
+            'current_temperature': self.current_temperature.item(),
+            'current_aux_weight': self.current_aux_weight.item(),
+            'expert_activation_std': torch.std(self.expert_activation_history).item(),
+            'expert_max_activation': torch.max(self.expert_activation_history).item(),
+            'expert_min_activation': torch.min(self.expert_activation_history).item(),
+        }
+        
+        if self.decoupled_gating:
+            stats.update({
+                'fusion_weights_std': torch.std(self.fusion_weights).item(),
+                'fusion_weights_max': torch.max(self.fusion_weights).item(),
+                'fusion_weights_min': torch.min(self.fusion_weights).item(),
+            })
+            
+        return stats

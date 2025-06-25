@@ -93,6 +93,7 @@ task_to_keys = {
 }
 
 test_name_mapping = {
+    "cola": "validation",
     "imdb": "test",
     "yelp_polarity": "test",
     "amazon_polarity": "test",
@@ -275,6 +276,7 @@ def parse_args():
     parser.add_argument('--max_expert_num', default=8, type=int, help='max number of experts')
     parser.add_argument('--adaptive_experts', action='store_true')
     parser.add_argument('--is_gshard_loss', action='store_true')
+    parser.add_argument("--gpu", type=str, default="0", help="The GPU(s) to use, e.g., '0' or '0,1'")
     
     # parser.add_argument('--normalize', action='store_true', help='normalize the weights of the first linear layer in each FFN')
     # parser.set_defaults(normalize=True)
@@ -302,6 +304,8 @@ def average_metric(metrics):
 
 
 def main(args, seed, temp_dir):
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -426,7 +430,7 @@ def main(args, seed, temp_dir):
     # if args.load_model and os.path.exists(args.load_model):
     #     print('load model from', args.load_model)
     #     tokenizer = torch.load(args.load_model+'/tokenizer.pth')
-    tokenizer = torch.load(temp_dir + '/tokenizer.pth')
+    tokenizer = torch.load(temp_dir + '/tokenizer.pth', weights_only=False)
     # else:
     #     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, 
     #                                             use_fast=not args.use_slow_tokenizer,
@@ -597,15 +601,15 @@ def main(args, seed, temp_dir):
         # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
         # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
+        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.mixed_precision == 'fp16' else None))
 
-    if not collected_data:
+    if args.include_training:
         train_dataloader = DataLoader(
             train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
         )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
-    if not collected_data:
+    if args.include_training:
         model, train_dataloader, eval_dataloader = accelerator.prepare(model, train_dataloader, eval_dataloader)
     else:
         model, eval_dataloader = accelerator.prepare(model, eval_dataloader)
@@ -618,13 +622,12 @@ def main(args, seed, temp_dir):
         # accelerator.init_trackers("glue_no_trainer", experiment_config)
 
     # Get the metric function
-    if args.task_name == "sick" and "stsb" in args.source_dir:
-        metric = evaluate.load("./dataset/glue/metrics.py", "stsb")
-    elif args.task_name is not None:
-        metric = evaluate.load("./dataset/glue/metrics.py", args.task_name)
+    if args.task_name is not None:
+        metric_name = args.task_name.replace("_ood", "")
+        metric = evaluate.load("./dataset/glue/metrics.py", metric_name)
     else:
         metric = evaluate.load("accuracy")
-    
+
     # Train!
 
     logger.info("***** Running test *****")

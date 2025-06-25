@@ -1,1 +1,221 @@
+# ====================
+# Operating System Files
+# ====================
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ====================
+# Python
+# ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ====================
+# Machine Learning & Deep Learning
+# ====================
+
+# Data files
+data/
+dataset/
+datasets/
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.parquet
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.mat
+
+# Model files
+models/
+model/
+checkpoints/
+checkpoint/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.pb
+*.onnx
+*.tflite
+*.model
+*.joblib
+*.bin
+*.safetensors
+
+# Training logs and outputs
+logs/
+log/
+runs/
+outputs/
+output/
+results/
+result/
+experiments/
+wandb/
+tensorboard/
+tb_logs/
+lightning_logs/
+
+# Configuration and temporary files
+*.yaml.bak
+*.yml.bak
+*.json.bak
+config_backup/
+temp/
+tmp/
+cache/
+.cache/
+
+# Distributed training
+multirun/
+.hydra/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# ====================
+# IDE and Editor Files
+# ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ====================
+# CUDA and GPU
+# ====================
+*.cu.o
+*.ptx
+
+# ====================
+# Conda
+# ====================
+*.tar.bz2
+
+# ====================
+# Large files (LFS)
+# ====================
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z
+
+# ====================
+# Project specific
+# ====================
+# Add any project-specific files or directories to ignore
+# Example:
+# custom_data/
+# local_configs/

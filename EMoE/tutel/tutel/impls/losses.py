@@ -77,3 +77,92 @@ def load_importance_loss(scores_wo_noise, topk_logits, num_global_experts, gate_
     l_imp = importance_loss(scores_wo_noise)
     l_load = load_loss(scores_wo_noise, topk_logits, num_global_experts, gate_noise)
     return (l_imp + l_load) / 2.0
+
+def progressive_auxiliary_loss(scores_w_noise, top_ids, num_global_experts, 
+                             training_step=0, total_steps=100000, 
+                             min_weight=0.001, max_weight=0.1):
+    """
+    创新点：渐进式辅助损失策略
+    Progressive Auxiliary Loss that starts small to encourage expert diversification,
+    then increases to ensure load balancing in later training stages.
+    
+    Args:
+        scores_w_noise: Gate scores with noise
+        top_ids: Selected expert indices
+        num_global_experts: Total number of experts
+        training_step: Current training step
+        total_steps: Total training steps
+        min_weight: Minimum loss weight (early training)
+        max_weight: Maximum loss weight (late training)
+    """
+    # 计算训练进度 (Training Progress)
+    progress = min(training_step / total_steps, 1.0)
+    
+    # 渐进式权重策略 (Progressive Weight Strategy)
+    # 前期小权重鼓励分化，后期大权重保证均衡
+    if progress < 0.3:  # 前30%训练时间：鼓励分化
+        loss_weight = min_weight + (max_weight - min_weight) * (progress / 0.3) * 0.2
+    elif progress < 0.7:  # 中间40%训练时间：平缓过渡
+        loss_weight = min_weight + (max_weight - min_weight) * 0.5
+    else:  # 后30%训练时间：强制均衡
+        loss_weight = min_weight + (max_weight - min_weight) * (0.5 + 0.5 * ((progress - 0.7) / 0.3))
+    
+    # 基础负载均衡损失
+    base_loss = gshard_loss(scores_w_noise, top_ids, num_global_experts)
+    
+    # 专家多样性损失 (Expert Diversity Loss) - 创新点
+    diversity_loss = 0.0
+    if progress < 0.5:  # 前期更注重多样性
+        num_samples = scores_w_noise.size(0)
+        expert_probs = torch.sum(scores_w_noise, dim=0) / num_samples
+        # 鼓励均匀分布，但允许一定程度的不均匀
+        diversity_target = torch.ones_like(expert_probs) / num_global_experts
+        diversity_loss = F.kl_div(expert_probs.log(), diversity_target, reduction='batchmean')
+        diversity_weight = (0.5 - progress) * 2.0  # 权重随进度递减
+        diversity_loss = diversity_loss * diversity_weight
+    
+    return loss_weight * base_loss + diversity_loss
+
+
+def decoupled_gate_loss(selection_scores, fusion_scores, top_ids, num_global_experts,
+                       expert_mask=None, orthogonal_weight=0.01):
+    """
+    创新点：解耦门控损失
+    Loss function for decoupled gating that encourages orthogonality between
+    selection and fusion networks while maintaining load balancing.
+    """
+    # 基础负载均衡损失
+    base_loss = gshard_loss(selection_scores, top_ids, num_global_experts)
+    
+    # 选择-融合正交损失 (Selection-Fusion Orthogonality Loss) - 创新点
+    if hasattr(selection_scores, 'grad_fn') and hasattr(fusion_scores, 'grad_fn'):
+        # 计算选择和融合分数的相关性
+        selection_norm = F.normalize(selection_scores, p=2, dim=1)
+        fusion_norm = F.normalize(fusion_scores, p=2, dim=1)
+        correlation = torch.sum(selection_norm * fusion_norm, dim=1)
+        
+        # 鼓励正交性（相关性接近0）
+        orthogonal_loss = torch.mean(correlation ** 2)
+        
+        return base_loss + orthogonal_weight * orthogonal_loss
+    
+    return base_loss
+
+
+def adaptive_importance_loss(scores_wo_noise, topk_logits, num_global_experts, 
+                           gate_noise, training_step=0, total_steps=100000):
+    """
+    创新点：自适应重要性损失
+    Adaptive importance loss that adjusts based on training progress.
+    """
+    # 原始重要性损失
+    base_loss = load_importance_loss(scores_wo_noise, topk_logits, num_global_experts, gate_noise)
+    
+    # 训练进度自适应权重
+    progress = min(training_step / total_steps, 1.0)
+    
+    # 早期训练：较小的重要性损失权重，允许专家自由分化
+    # 后期训练：较大的重要性损失权重，强制负载均衡
+    adaptive_weight = 0.1 + 0.9 * (progress ** 2)  # 二次增长
+    
+    return adaptive_weight * base_loss
